@@ -18,11 +18,13 @@ struct Args {
 fn train_network(data: MNISTData) {
     let mut network = Network::new_random(&[data.training.images.shape().0, 30, 10]);
 
-    network.learn_sgd_tested(&data.training, &data.test, 30, 10, 3.0);
+    network.learn_sgd(&data.training, Some(&data.test), 30, 10, 3.0);
 }
 
 fn main() {
     let args = Args::parse();
+
+    println!("Loading MNIST data");
 
     match MNISTData::parse(&args.mnist_folder) {
         Ok(data) => train_network(data),

@@ -12,3 +12,4 @@ itertools = "0.10.5"
 nalgebra = { version = "0.31.4", features = ["rand"] }
 permutation_iterator = "0.1.2"
 rand = "0.8.5"
+rayon = "1.6.0"

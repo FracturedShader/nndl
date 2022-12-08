@@ -1,9 +1,14 @@
-use std::iter::zip;
+use std::{
+    io::{self, Write},
+    iter::zip,
+    time::{Duration, Instant},
+};
 
 use itertools::{izip, Itertools};
-use nalgebra::{DMatrix, DVector, Dynamic, Matrix, RawStorage, U1};
+use nalgebra::{DMatrix, DVector};
 use permutation_iterator::Permutor;
 use rand::Rng;
+use rayon::prelude::*;
 
 use crate::mnist::MNISTDataSet;
 
@@ -25,8 +30,6 @@ pub struct Network {
     layer_sizes: Vec<usize>,
     biases: Vec<DVector<f32>>,
     weights: Vec<DMatrix<f32>>,
-    nabla_b: Vec<DVector<f32>>,
-    nabla_w: Vec<DMatrix<f32>>,
 }
 
 impl Network {
@@ -47,14 +50,10 @@ impl Network {
             })
             .collect();
 
-        let (nabla_b, nabla_w) = Self::make_nablas(&biases, &weights);
-
         Network {
             layer_sizes: Vec::from(layer_sizes),
             biases,
             weights,
-            nabla_b,
-            nabla_w,
         }
     }
 
@@ -65,89 +64,90 @@ impl Network {
     pub fn learn_sgd(
         &mut self,
         training_data: &MNISTDataSet,
-        epochs: u32,
-        batch_size: usize,
-        eta: f32,
-    ) {
-        let data_len = training_data.images.len() as u64;
-        let batches_len = (data_len as usize + batch_size - 1) / batch_size;
-
-        for i in 0..epochs {
-            for (i, batch) in Permutor::new(data_len)
-                .chunks(batch_size)
-                .into_iter()
-                .enumerate()
-            {
-                print!("Updating batch {}/{}\r", i, batches_len);
-                self.update_batch(training_data, batch, batch_size, eta);
-            }
-
-            println!("Epoch {} complete", i);
-        }
-    }
-
-    pub fn learn_sgd_tested(
-        &mut self,
-        training_data: &MNISTDataSet,
-        testing_data: &MNISTDataSet,
+        testing_data: Option<&MNISTDataSet>,
         epochs: u32,
         batch_size: usize,
         eta: f32,
     ) {
         let data_len = training_data.images.ncols() as u64;
-        let test_data_len = testing_data.images.ncols();
+        let test_data_len = testing_data.map(|td| td.images.ncols()).unwrap_or_default();
         let batches_len = (data_len as usize + batch_size - 1) / batch_size;
 
-        for i in 0..epochs {
-            for (i, batch) in Permutor::new(data_len)
+        let print_freq = Duration::from_millis(200);
+        let mut last_print = Instant::now() - print_freq;
+
+        let mut parallel_time = Option::<u128>::None;
+        let mut serial_time = Option::<u128>::None;
+
+        for epoch_idx in 0..epochs {
+            let batch_start = Instant::now();
+            let parallel = match (parallel_time, serial_time) {
+                (None, _) => true,
+                (_, None) => false,
+                (Some(a), Some(b)) => a < b,
+            };
+
+            for (batch_idx, batch) in Permutor::new(data_len)
                 .chunks(batch_size)
                 .into_iter()
                 .enumerate()
             {
-                print!("Updating batch {}/{}\r", i, batches_len);
-                self.update_batch(training_data, batch, batch_size, eta);
+                if last_print.elapsed() > print_freq {
+                    print!("\rUpdating batch {}/{}", batch_idx, batches_len);
+                    io::stdout().flush().unwrap();
+                    last_print = Instant::now();
+                }
+
+                if parallel {
+                    self.update_batch_parallel(
+                        training_data,
+                        batch.map(|i| i as usize).collect(),
+                        eta,
+                    );
+                } else {
+                    self.update_batch(training_data, batch.map(|i| i as usize).collect(), eta);
+                }
             }
 
-            println!("Evaluating network against test data.");
+            let elapsed = batch_start.elapsed().as_millis();
 
-            let correct_count = self.evaluate(testing_data);
+            if parallel {
+                &mut parallel_time
+            } else {
+                &mut serial_time
+            }
+            .get_or_insert(elapsed);
 
             println!(
-                "Epoch {} score: {}% ({}/{})",
-                i,
-                100.0 * correct_count as f32 / test_data_len as f32,
-                correct_count,
-                test_data_len
+                "\rUpdating batch {}/{0} completed in {} in {}ms",
+                batches_len,
+                if parallel { "parallel" } else { "serial" },
+                elapsed
             );
-        }
-    }
-}
 
-fn ascii_ramp(v: f32) -> char {
-    let gradient = r#"$@B%8&WM#*oahkbdpqwmZO0QLCJUYXzcvunxrjft/\|()1{}[]?-_+~<>i!lI;:,"^`'. "#;
-    let ci = v * ((gradient.len() - 1) as f32);
+            if let Some(td) = testing_data {
+                print!("Evaluating network");
+                io::stdout().flush().unwrap();
 
-    gradient.chars().nth(ci as usize).unwrap()
-}
+                let correct_count = self.evaluate(td);
 
-fn display_image<'a, I>(data: I)
-where
-    I: Iterator<Item = &'a f32>,
-{
-    for (i, &v) in data.enumerate() {
-        let c = ascii_ramp(1.0 - v);
-
-        if i % 28 == 27 {
-            println!("{}{}", c, c);
-        } else {
-            print!("{}{}", c, c);
+                println!(
+                    "\rEpoch {} score: {}% ({}/{})",
+                    epoch_idx,
+                    100.0 * correct_count as f32 / test_data_len as f32,
+                    correct_count,
+                    test_data_len
+                );
+            } else {
+                println!("Epoch {} complete", epoch_idx);
+            }
         }
     }
 }
 
 impl Network {
     fn back_prop(
-        &mut self,
+        &self,
         training_data: &MNISTDataSet,
         src_idx: usize,
     ) -> (Vec<DVector<f32>>, Vec<DMatrix<f32>>) {
@@ -210,18 +210,14 @@ impl Network {
             .map(|(img, expected)| {
                 let res = self.feed_forward(img.clone_owned());
 
-                if res.argmax().0 == *expected as usize {
-                    1
-                } else {
-                    0
-                }
+                usize::from(res.argmax().0 == *expected as usize)
             })
             .sum()
     }
 
     fn make_nablas(
-        biases: &Vec<DVector<f32>>,
-        weights: &Vec<DMatrix<f32>>,
+        biases: &[DVector<f32>],
+        weights: &[DMatrix<f32>],
     ) -> (Vec<DVector<f32>>, Vec<DMatrix<f32>>) {
         (
             biases.iter().map(|v| DVector::zeros(v.nrows())).collect(),
@@ -236,48 +232,53 @@ impl Network {
         )
     }
 
-    fn update_batch<I>(
-        &mut self,
-        training_data: &MNISTDataSet,
-        batch: I,
-        batch_size: usize,
-        eta: f32,
-    ) where
-        I: Iterator<Item = u64>,
-    {
-        self.zero_nabla();
+    fn update_batch(&mut self, training_data: &MNISTDataSet, batch: Vec<usize>, eta: f32) {
+        let (nabla_b, nabla_w) = batch
+            .iter()
+            .map(|&idx| self.back_prop(training_data, idx))
+            .reduce(|(mut nb, mut nw), (dnb, dnw)| {
+                nb.iter_mut().zip(dnb).for_each(|(n, dn)| *n += dn);
+                nw.iter_mut().zip(dnw).for_each(|(n, dn)| *n += dn);
 
-        for idx in batch {
-            let (delta_nabla_bias, delta_nabla_weights) =
-                self.back_prop(training_data, idx as usize);
+                (nb, nw)
+            })
+            .expect("Batch size shouldn't be zero");
 
-            for (nb, dnb) in self.nabla_b.iter_mut().zip(delta_nabla_bias) {
-                *nb += dnb;
-            }
+        let rate = eta / (batch.len() as f32);
 
-            for (nw, dnw) in self.nabla_w.iter_mut().zip(delta_nabla_weights) {
-                *nw += dnw;
-            }
-        }
+        self.biases
+            .iter_mut()
+            .zip(nabla_b)
+            .for_each(|(b, nb)| *b -= nb * rate);
 
-        let rate = eta / (batch_size as f32);
-
-        for (b, nb) in self.biases.iter_mut().zip(&self.nabla_b) {
-            *b -= nb * rate;
-        }
-
-        for (w, nw) in self.weights.iter_mut().zip(&self.nabla_w) {
-            *w -= nw * rate;
-        }
+        self.weights
+            .iter_mut()
+            .zip(nabla_w)
+            .for_each(|(w, nw)| *w -= nw * rate);
     }
 
-    fn zero_nabla(&mut self) {
-        for v in self.nabla_b.iter_mut() {
-            v.fill(0.0);
-        }
+    fn update_batch_parallel(&mut self, training_data: &MNISTDataSet, batch: Vec<usize>, eta: f32) {
+        let (nabla_b, nabla_w) = batch
+            .par_iter()
+            .map(|&idx| self.back_prop(training_data, idx))
+            .reduce_with(|(mut nb, mut nw), (dnb, dnw)| {
+                nb.par_iter_mut().zip(dnb).for_each(|(n, dn)| *n += dn);
+                nw.par_iter_mut().zip(dnw).for_each(|(n, dn)| *n += dn);
 
-        for v in self.nabla_w.iter_mut() {
-            v.fill(0.0);
-        }
+                (nb, nw)
+            })
+            .expect("Batch size shouldn't be zero");
+
+        let rate = eta / (batch.len() as f32);
+
+        self.biases
+            .par_iter_mut()
+            .zip(nabla_b)
+            .for_each(|(b, nb)| *b -= nb * rate);
+
+        self.weights
+            .par_iter_mut()
+            .zip(nabla_w)
+            .for_each(|(w, nw)| *w -= nw * rate);
     }
 }
