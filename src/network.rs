@@ -206,11 +206,12 @@ impl Network {
         test_data
             .images
             .column_iter()
-            .zip(test_data.labels.iter())
+            .zip(test_data.labels.row_iter())
+            .par_bridge()
             .map(|(img, expected)| {
                 let res = self.feed_forward(img.clone_owned());
 
-                usize::from(res.argmax().0 == *expected as usize)
+                usize::from(res.argmax().0 == expected.x as usize)
             })
             .sum()
     }
