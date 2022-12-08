@@ -132,14 +132,15 @@ impl Network {
                 let correct_count = self.evaluate(td);
 
                 println!(
-                    "\rEpoch {} score: {}% ({}/{})",
-                    epoch_idx,
+                    "\rEpoch {}/{} score: {}% ({}/{})",
+                    epoch_idx + 1,
+                    epochs,
                     100.0 * correct_count as f32 / test_data_len as f32,
                     correct_count,
                     test_data_len
                 );
             } else {
-                println!("Epoch {} complete", epoch_idx);
+                println!("Epoch {}/{} complete", epoch_idx + 1, epochs);
             }
         }
     }
